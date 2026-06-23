@@ -2,17 +2,12 @@
 #include "NavState.h"
 
 #include <Wire.h>
-#include <MPU6050_light.h>    // Matches your working Map project
-#include <QMC5883LCompass.h>  // Matches your working Map project
+#include <MPU6050_light.h>
+#include <QMC5883LCompass.h>
 
 #if FEATURE_BMP
 #include <Adafruit_BMP3XX.h>
 #endif
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  SensorTask
-//  Core 1, 100 Hz. Reads sensors and writes to NavState.
-// ─────────────────────────────────────────────────────────────────────────────
 
 static MPU6050 s_mpu(Wire);
 static QMC5883LCompass s_compass;
@@ -21,25 +16,17 @@ static QMC5883LCompass s_compass;
 static Adafruit_BMP3XX s_bmp;
 #endif
 
-// ── Init all I2C sensors ─────────────────────────────────────────────────────
 bool sensor_init() {
-    // 1. Start I2C with your Map Project Pins
-    Wire.begin(17, 18); 
+    Wire.begin(17, 18);
 
-    // 2. Init MPU6050_light
     byte status = s_mpu.begin();
-    if (status != 0) {
-        log_e("MPU6050 not found at 0x68");
-        return false;
-    }
+    if (status != 0) { log_e("MPU6050 not found"); return false; }
 
-    // 3. Calibrate (Device must be still!)
-    log_i("MPU-6050 OK. Calibrating... DO NOT MOVE.");
+    log_i("MPU-6050 OK. Calibrating...");
     vTaskDelay(pdMS_TO_TICKS(1000));
-    s_mpu.calcOffsets(); 
-    log_i("Calibration Done.");
+    s_mpu.calcOffsets();
+    log_i("Calibration done.");
 
-    // 4. Init QMC5883L Compass
     s_compass.init();
     log_i("Compass OK");
 
@@ -52,69 +39,82 @@ bool sensor_init() {
         log_i("BMP390 OK");
     }
 #endif
-
     return true;
 }
 
-// ── Main sensor task ─────────────────────────────────────────────────────────
 void SensorTask(void* pvParams) {
-    // Sliding window for vibration RMS
     const int VIB_WIN = 20;
     float vib_buf[VIB_WIN] = {0};
     int vib_idx = 0;
     float prev_amag = 0;
 
+    // EM variance window
+    const int EM_WIN = 20;
+    float em_buf[EM_WIN] = {0};
+    int em_idx = 0;
+
     TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
-        // 1. Update library states
         s_mpu.update();
         s_compass.read();
 
-        // 2. Get Raw Data
-        float ax = s_mpu.getAccX() * 9.81f; // Convert g to m/s^2
+        float ax = s_mpu.getAccX() * 9.81f;
         float ay = s_mpu.getAccY() * 9.81f;
         float az = s_mpu.getAccZ() * 9.81f;
         float gx = s_mpu.getGyroX();
         float gy = s_mpu.getGyroY();
         float gz = s_mpu.getGyroZ();
-        
         int heading = s_compass.getAzimuth();
 
-        // 3. Vibration RMS (Desk impact detection)
+        // Vibration RMS
         float amag = sqrtf(ax*ax + ay*ay + az*az);
         float delta = fabsf(amag - prev_amag);
         prev_amag = amag;
         vib_buf[vib_idx++ % VIB_WIN] = delta * delta;
         float vib_sum = 0;
-        for (int i=0; i<VIB_WIN; i++) vib_sum += vib_buf[i];
+        for (int i = 0; i < VIB_WIN; i++) vib_sum += vib_buf[i];
         float vib_rms = sqrtf(vib_sum / VIB_WIN);
 
-        // 4. Motion state logic
+        // EM variance (magnitude of mag vector)
+        float mx = s_compass.getX();
+        float my = s_compass.getY();
+        float mz = s_compass.getZ();
+        float mmag = sqrtf(mx*mx + my*my + mz*mz);
+        em_buf[em_idx++ % EM_WIN] = mmag;
+        float em_mean = 0;
+        for (int i = 0; i < EM_WIN; i++) em_mean += em_buf[i];
+        em_mean /= EM_WIN;
+        float em_var = 0;
+        for (int i = 0; i < EM_WIN; i++) {
+            float d = em_buf[i] - em_mean;
+            em_var += d * d;
+        }
+        em_var /= EM_WIN;
+
         bool moving = fabsf(amag - 9.81f) > (MOVING_THRESHOLD * 9.81f);
 
-        // 5. Write to NavState under mutex
         WITH_STATE([&]{
-            g_state.raw = {ax, ay, az, gx, gy, gz, 0, 0, 0, 0, 0};
+            g_state.raw = {ax, ay, az, gx, gy, gz, mx, my, mz, 0, 0};
             g_state.orient = {
-                s_mpu.getAngleY(), // roll
-                s_mpu.getAngleX(), // pitch
-                0.0f,              // yaw (relative)
-                (float)heading,    // compass heading
-                0,0,0,0            // quats not used by light lib
+                s_mpu.getAngleY(),
+                s_mpu.getAngleX(),
+                0.0f,
+                (float)heading,
+                0,0,0,0
             };
-            g_state.motion.moving = moving;
+            g_state.motion.moving        = moving;
             g_state.motion.vibration_rms = vib_rms;
-            
-            if (vib_rms > IMPACT_THRESHOLD)
-                g_state.motion.impact_count++;
-            
+            g_state.motion.em_variance   = em_var;
+
+            if (vib_rms > IMPACT_THRESHOLD) g_state.motion.impact_count++;
+            if (em_var  > EM_SPIKE_THRESHOLD) g_state.motion.em_spike_count++;
+
             g_state.last_sensor_ms = millis();
         });
 
-        // Log impact events
-        if (vib_rms > IMPACT_THRESHOLD)
-            nav_log_event(EventType::IMPACT, vib_rms);
+        if (vib_rms > IMPACT_THRESHOLD) nav_log_event(EventType::IMPACT, vib_rms);
+        if (em_var  > EM_SPIKE_THRESHOLD) nav_log_event(EventType::EM_SPIKE, em_var);
 
 #if FEATURE_BMP
         static uint8_t bmp_div = 0;
@@ -128,7 +128,6 @@ void SensorTask(void* pvParams) {
             }
         }
 #endif
-
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10)); // 100 Hz
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
     }
 }
